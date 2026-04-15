@@ -136,11 +136,19 @@ sudo systemctl status mysql
 mysql -u your_username -p -e "SHOW DATABASES;" | grep test_db
 ```
 
+**Build the frontend:**
+
+```bash
+cd client && npm install && npm run build
+```
+
+> **Note:** The React app must be built (`npm run build`) before starting the server. Express serves the compiled static files from `client/public/`. Running the server without building first will result in a blank frontend.
+
 **Install dependencies and start the backend:**
 
 ```bash
-cd server && npm install
-node server.js
+cd ../server && npm install
+cd .. && node server/server.js
 ```
 
 The server printed:
@@ -149,14 +157,6 @@ The server printed:
 Server running at http://localhost:5000
 Database connected.
 ```
-
-**Build the frontend:**
-
-```bash
-cd ../client && npm install && npm run build
-```
-
-> **Note:** The React app must be built (`npm run build`) before starting the server. Express serves the compiled static files from `client/public/`. Running the server without building first will result in a blank frontend.
 
 **Verify end to end:**
 
