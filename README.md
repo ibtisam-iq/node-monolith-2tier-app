@@ -98,11 +98,11 @@ MYSQL_ROOT_PASSWORD=your_root_password
 MYSQL_DATABASE=test_db
 MYSQL_USER=your_username
 MYSQL_PASSWORD=your_password
-DB_HOST=db
+DB_HOST=localhost
 PORT=5000
 ```
 
-> **Note:** `DB_HOST` must be set to `db` when running via Docker Compose (Docker resolves the service name as a hostname on the internal network). For local bare-metal runs without Docker, set it to `localhost`.
+> **Note:** For local bare-metal runs, `DB_HOST=localhost` is correct — MySQL is running directly on the same machine. When running via Docker Compose, change `DB_HOST` to match the database service name defined in `compose.yml` (e.g., `db`). Docker resolves that service name as a hostname on the internal container network, so `localhost` will not work there.
 
 ---
 
@@ -136,24 +136,40 @@ sudo systemctl status mysql
 mysql -u your_username -p -e "SHOW DATABASES;" | grep test_db
 ```
 
-**Install dependencies and run the server:**
+**Install dependencies and start the backend:**
 
 ```bash
-# Install server dependencies
 cd server && npm install
-
-# Install client dependencies and build the React bundle
-cd ../client && npm install && npm run build
-
-# Load env vars and start the server
-cd ..
-set -a && source .env && set +a
-node server/server.js
+node server.js
 ```
 
-> **Why `set -a`?** `set -a` marks every variable sourced from `.env` for automatic export into the child process (Node.js). `set +a` turns off the flag after sourcing so subsequent shell variables are not unintentionally exported.
+The server printed:
+
+```
+Server running at http://localhost:5000
+Database connected.
+```
+
+**Build the frontend:**
+
+```bash
+cd ../client && npm install && npm run build
+```
 
 > **Note:** The React app must be built (`npm run build`) before starting the server. Express serves the compiled static files from `client/public/`. Running the server without building first will result in a blank frontend.
+
+**Verify end to end:**
+
+```bash
+# Confirm the backend API is up
+curl http://localhost:5000/api/test
+
+# Confirm the API returns users
+curl http://localhost:5000/api/users
+
+# Confirm the frontend is being served
+curl http://localhost:5000
+```
 
 App runs at: `http://localhost:5000`
 
