@@ -1,1 +1,15 @@
+# .gitignore
+.DS_Store
+.scratchpad
 
+# Environment secrets — NEVER commit real credentials
+.env
+.env.*
+!.env.example
+
+# node_modules and build artifacts
+node_modules/
+
+# webpack build output
+client/public/bundle.js
+client/public/*.png
