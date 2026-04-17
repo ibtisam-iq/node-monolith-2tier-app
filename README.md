@@ -47,8 +47,6 @@ node-monolith-2tier-app/
 
 Two-tier architecture: Presentation (React SPA) + Business Logic + Data Access — all handled by a **single Express process** (`server.js`) that embeds routes and SQL queries inline, with no separate model or controller layer in the active code path.
 
-> **Note:** This is the 2-tier variant of the Node monolith. The [3-tier variant](https://github.com/ibtisam-iq/node-monolith-3tier-app) refactors this same application into a clean MVC structure — separating routes, controllers, models, and a connection pool into dedicated files. The architecture distinction is the whole point of having both repos.
-
 ---
 
 ## Technology Stack
@@ -72,9 +70,11 @@ Two-tier architecture: Presentation (React SPA) + Business Logic + Data Access �
 
 ### Step 0 — Codebase Audit
 
-Before doing any DevOps work, I audited the codebase — identifying dead code paths, confirming the active code path is `server.js` only, and establishing the architectural boundary between the 2-tier and 3-tier variants.
+Before doing any DevOps work, I audited and modernized the inherited codebase — identifying dead code paths, removing hardcoded DB credentials, pinning dependency versions, and confirming the active code path is `server.js` only.
 
 > I used **AI-assisted analysis (Perplexity Pro)** for this step. Full audit notes and dependency analysis: [`docs/codebase-audit.md`](docs/codebase-audit.md)
+
+As a separate exercise, I also refactored this same codebase into a clean MVC structure — separating routes, controllers, models, and a connection pool into dedicated files. That variant lives here: **[node-monolith-3tier-app](https://github.com/ibtisam-iq/node-monolith-3tier-app)**
 
 ---
 
