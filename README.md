@@ -30,8 +30,15 @@ node-monolith-2tier-app/
 │   └── package.json                # Express, MySQL2, dotenv, cors
 ├── database/
 │   └── init.sql                    # Schema bootstrap
-├── docs/                           # Architecture notes
+├── docs/
+│   ├── docker-setup.md             # Line-by-line Dockerfile and Compose rationale
+│   ├── understand-architecture.md  # Deep-dive into app structure and design
+│   └── local-setup-troubleshooting.md
 ├── assets/                         # Project images
+├── Dockerfile                      # Multi-stage build: client build → server deps → runtime
+├── compose.yml                     # Local containerized environment (app + MySQL)
+├── .dockerignore                   # Excludes node_modules, .env, build artifacts from context
+├── .gitignore                      # Excludes .env, node_modules from version control
 ├── .env.example                    # Environment variable template
 └── compose.yml
 ```
@@ -55,6 +62,7 @@ Two-tier architecture: Presentation (React SPA) + Business Logic + Data Access �
 | Database | MySQL |
 | Environment | dotenv |
 | Build Tool | npm |
+| Containerization | Docker (multi-stage) + Docker Compose |
 
 ---
 
@@ -102,7 +110,7 @@ DB_HOST=localhost
 PORT=5000
 ```
 
-> **Note:** For local bare-metal runs, `DB_HOST=localhost` is correct — MySQL is running directly on the same machine. When running via Docker Compose, change `DB_HOST` to match the database service name defined in `compose.yml` (e.g., `db`). Docker resolves that service name as a hostname on the internal container network, so `localhost` will not work there.
+> **Note:** For local bare-metal runs, `DB_HOST=localhost` is correct — MySQL is running directly on the same machine. When running via Docker Compose, `DB_HOST` is overridden to `mysql` (the database service name defined in `compose.yml`) via the `environment:` block. Docker resolves that service name as a hostname on the internal container network, so `localhost` will not work there.
 
 ---
 
@@ -175,9 +183,55 @@ App runs at: `http://localhost:5000`
 
 ---
 
-### Step 3 — DevSecOps Pipelines (CI/CD)
+### Step 3 — Containerization (Docker)
 
-With the application validated locally, I built automated pipelines to transform this code into a secure, deployable artifact.
+With the application validated on bare metal, I wrote the `Dockerfile` and `compose.yml` from scratch. I read `server/package.json`, `client/package.json`, `.env.example`, and `server/server.js` before writing a single line — to understand exactly what the image needed: Node version, build stages, exposed port, health endpoint, and environment variable strategy.
+
+**Key decisions I made and documented:**
+
+- Three-stage build (client build → server deps → runtime) to keep the image lean and exclude Webpack, Babel, and devDependencies from production
+- Non-root user for CIS/Trivy compliance
+- Exec form `ENTRYPOINT` so Node.js runs as PID 1 and receives SIGTERM directly for graceful shutdown
+- `${PORT:-5000}` default fallback so the container runs without a `.env` file present
+- Healthcheck timing tuned to Node.js + MySQL's actual cold-start duration
+
+The full rationale for every line is in [`docs/docker-setup.md`](docs/docker-setup.md).
+
+#### Validating with Docker Compose
+
+After writing the files, I validated them end-to-end using Docker Compose — spinning up both MySQL and the app as containers on a shared internal network, with no local MySQL installation needed.
+
+```bash
+cp .env.example .env
+# Fill in: MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD, PORT
+
+docker compose up --build
+```
+
+> `--build` forces the Docker image to be rebuilt from the `Dockerfile`. Omit it on subsequent runs if the source code has not changed.
+
+**What happens in sequence:**
+1. Docker builds the `node-monolith-2tier-app` image using the three-stage `Dockerfile`
+2. The `mysql` container (MySQL 8.4 LTS) starts and runs its healthcheck (`mysqladmin ping -h localhost`)
+3. The `app` container waits for the `mysql` healthcheck to pass (`condition: service_healthy`)
+4. Express connects to MySQL using the service name `mysql` as the hostname (overrides `localhost` from `.env`)
+5. The app becomes available at `http://localhost:5000`
+
+**Stop and clean up:**
+
+```bash
+# Stop containers but keep the database volume
+docker compose down
+
+# Stop containers AND delete the database volume (full reset)
+docker compose down -v
+```
+
+---
+
+### Step 4 — DevSecOps Pipelines (CI/CD)
+
+With the application validated both natively and in containers, I built automated pipelines to transform this code into a secure, deployable artifact.
 
 Pipelines include: npm build → SonarQube analysis → Trivy vulnerability scan → Docker image build → Nexus artifact management → Jenkins & GitHub Actions automation.
 
@@ -185,7 +239,7 @@ Pipelines include: npm build → SonarQube analysis → Trivy vulnerability scan
 
 ---
 
-### Step 4 — Platform Engineering (Deployment & Operations)
+### Step 5 — Platform Engineering (Deployment & Operations)
 
 Once the artifact was ready, I deployed it using multiple industry-standard approaches.
 
