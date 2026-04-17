@@ -2,7 +2,8 @@
 # Stage 1 — Client Build
 # Compile React frontend with Webpack into client/public/
 # =============================================================
-FROM node:18-alpine AS client-build
+FROM node:22-alpine AS client-build
+# node:18 reached EOL April 2025 — node:22 is current LTS (supported until April 2027)
 
 WORKDIR /app/client
 
@@ -22,7 +23,7 @@ RUN npm run build
 # Stage 2 — Server Dependencies
 # Install production-only Node.js dependencies for the server
 # =============================================================
-FROM node:18-alpine AS server-deps
+FROM node:22-alpine AS server-deps
 
 WORKDIR /app/server
 
@@ -37,7 +38,7 @@ RUN npm install --omit=dev
 # Assemble final lean image from outputs of Stage 1 and Stage 2
 # No Webpack, no Babel, no devDependencies in production
 # =============================================================
-FROM node:18-alpine AS runtime
+FROM node:22-alpine AS runtime
 
 # OCI standard image labels
 LABEL org.opencontainers.image.title="NodeApp" \
@@ -70,14 +71,20 @@ COPY --from=client-build /app/client/public ./client/public
 RUN chown -R appuser:appgroup /app
 USER appuser
 
-EXPOSE 5000
+# PORT is read from the environment at runtime via .env or compose.yml.
+# ARG sets the build-time default; ENV makes it available at runtime.
+# EXPOSE reflects the actual port the container listens on — never hardcoded.
+ARG PORT=5000
+ENV PORT=${PORT}
+EXPOSE ${PORT}
 
 # Health check using GET / — the Express wildcard route serves index.html (HTTP 200)
 # when the server is fully running. No dedicated /health endpoint exists in server.js.
 # start-period=40s: Node.js boots fast but MySQL connection initialization adds time
 # wget is used (not curl) — curl is NOT in Alpine base image by default
+# CMD-SHELL form required: allows shell variable expansion for ${PORT:-5000}
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:5000/ || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-5000}/ || exit 1
 
 # Exec form: node runs as PID 1 — receives SIGTERM directly for graceful shutdown
 # Shell form would make /bin/sh PID 1 which does NOT forward signals to Node.js
