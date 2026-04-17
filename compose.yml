@@ -1,4 +1,8 @@
-# Docker Compose — Node.js 2-Tier Application
+# ============================================================
+# Docker Compose — Local Development Environment
+# For production deployments, see: platform-engineering-systems repo
+# ============================================================
+
 # App:   node-monolith-2tier-app (Express + React, port 5000)
 # DB:    MySQL 8.4 LTS
 #
