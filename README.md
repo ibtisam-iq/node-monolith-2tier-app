@@ -9,6 +9,8 @@ This is a Node.js + React-based monolithic user management web application servi
 
 > I did not build this application from scratch. As a DevOps Engineer, my focus is on everything that happens **around the code** — building, securing, packaging, and operating it in production-like environments.
 
+> The files I added to this repository are: `Dockerfile`, `compose.yml`, `.dockerignore`, and `.gitignore`. Everything else under `client/` and `server/` belongs to the original developer.
+
 ---
 
 ## Application Structure
@@ -31,6 +33,7 @@ node-monolith-2tier-app/
 ├── database/
 │   └── init.sql                    # Schema bootstrap
 ├── docs/
+│   ├── codebase-audit.md           # Step 0 — dependency analysis and dead code audit
 │   ├── docker-setup.md             # Line-by-line Dockerfile and Compose rationale
 │   ├── understand-architecture.md  # Deep-dive into app structure and design
 │   └── local-setup-troubleshooting.md
@@ -39,8 +42,7 @@ node-monolith-2tier-app/
 ├── compose.yml                     # Local containerized environment (app + MySQL)
 ├── .dockerignore                   # Excludes node_modules, .env, build artifacts from context
 ├── .gitignore                      # Excludes .env, node_modules from version control
-├── .env.example                    # Environment variable template
-└── compose.yml
+└── .env.example                    # Environment variable template
 ```
 
 Two-tier architecture: Presentation (React SPA) + Business Logic + Data Access — all handled by a **single Express process** (`server.js`) that embeds routes and SQL queries inline, with no separate model or controller layer in the active code path.
@@ -70,23 +72,9 @@ Two-tier architecture: Presentation (React SPA) + Business Logic + Data Access �
 
 ### Step 0 — Codebase Audit
 
-The original codebase has all CRUD routes and raw SQL queries written inline inside `server.js` — no separation between routing, business logic, and data access. This is the defining characteristic of the 2-tier structure: one backend process handles everything end to end.
+Before doing any DevOps work, I audited the codebase — identifying dead code paths, confirming the active code path is `server.js` only, and establishing the architectural boundary between the 2-tier and 3-tier variants.
 
-The `server/` directory also contains orphaned MVC files (`app.js`, `config/db.js`, `routes/`, `controllers/`, `models/`) that are not wired into `server.js`. These represent an incomplete refactor attempt. The active code path is `server.js` only.
-
-> **Note:** I used **AI-assisted analysis (Perplexity Pro)** to audit the codebase structure, identify the dead code paths, and understand the architectural boundary between 2-tier and 3-tier. This architectural clarity is what makes the DevOps work — pipelines and deployment configs — reproducible and understandable.
-
-**Dependency state of `server/package.json`:**
-
-| Package | Version | Notes |
-|---|---|---|
-| `express` | `^4.21.2` | Latest 4.x with security patches |
-| `mysql2` | `^3.11.3` | v3 connection pool with async support |
-| `dotenv` | `^16.4.7` | Env var loading |
-| `cors` | `^2.8.5` | Cross-origin support |
-| `body-parser` | Absent | Correctly omitted — bundled in Express since v4.16 |
-
-**Note on `client/package.json`:** The client still uses `react@17` and `axios@0.21.1`. These are not upgraded here — this repo intentionally preserves the original 2-tier codebase as-is for architectural comparison purposes.
+> I used **AI-assisted analysis (Perplexity Pro)** for this step. Full audit notes and dependency analysis: [`docs/codebase-audit.md`](docs/codebase-audit.md)
 
 ---
 
@@ -114,9 +102,9 @@ PORT=5000
 
 ---
 
-### Step 2 — Local Build & Validation
+### Step 2 — Local Build & Bare-Metal Validation
 
-Before building any pipeline, I validated the full application lifecycle locally.
+Before writing any Docker config, I validated the full application lifecycle locally — native MySQL, native Node.js, no containers. This confirmed the build was clean and the app connected to the database correctly before I introduced any containerization layer.
 
 **Install and configure MySQL:**
 
@@ -216,6 +204,13 @@ docker compose up --build
 3. The `app` container waits for the `mysql` healthcheck to pass (`condition: service_healthy`)
 4. Express connects to MySQL using the service name `mysql` as the hostname (overrides `localhost` from `.env`)
 5. The app becomes available at `http://localhost:5000`
+
+**Verify the app is running:**
+
+```bash
+curl http://localhost:5000
+curl http://localhost:5000/api/users
+```
 
 **Stop and clean up:**
 
