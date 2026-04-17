@@ -1,0 +1,108 @@
+# Docker Compose — Node.js 2-Tier Application
+# App:   node-monolith-2tier-app (Express + React, port 5000)
+# DB:    MySQL 8.4 LTS
+#
+# Usage:
+#   cp .env.example .env   # fill in your values
+#   docker compose up --build
+
+name: nodeapp
+
+services:
+
+  # -------------------------------------------------------
+  # MySQL 8.4 LTS Database
+  # -------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    # mysql:8 is a floating tag that could resolve to EOL 8.0
+    # mysql:8.4 pins to the current LTS — explicit and reproducible
+    container_name: nodeapp-mysql
+    restart: unless-stopped
+
+    # env_file loads ALL variables from .env automatically
+    # The environment: block below is kept for documentation only —
+    # it shows exactly which 4 variables mysql:8.4 requires for initialization
+    env_file: .env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+
+    volumes:
+      # Named volume: data persists across docker compose down
+      # Only docker compose down -v destroys it
+      - mysql-data:/var/lib/mysql
+      # Init script: executed automatically on FIRST startup only (when data dir is empty)
+      # :ro — container can read but not modify the schema file
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    networks:
+      - app-network
+
+    healthcheck:
+      # CRITICAL: use -h localhost, NOT -h mysql
+      # "mysql" is the Compose service name — it resolves from OTHER containers on the network
+      # Inside this container, the correct hostname for the local MySQL server is localhost
+      # Using "-h mysql" here causes: Unknown MySQL server host 'mysql' — healthcheck always fails
+      # and the app service (condition: service_healthy) would never start
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # -------------------------------------------------------
+  # Node.js Application (Express + React)
+  # -------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Explicit image name — enables direct registry push without re-tagging
+    # Without this, Docker uses the default: nodeapp-app
+    image: node-monolith-2tier-app
+    container_name: nodeapp-app
+    restart: unless-stopped
+
+    # env_file loads ALL variables from .env automatically (PORT, MYSQL_USER, MYSQL_PASSWORD, etc.)
+    # The only environment: entry needed is DB_HOST — to override the .env value
+    #
+    # .env has DB_HOST=localhost — correct for bare-metal, WRONG for Docker
+    # Inside the app container, localhost = the app container itself (nothing on 3306)
+    # In Docker Compose, the correct hostname is the service name: mysql
+    # Docker's internal DNS resolves "mysql" to the MySQL container's IP on app-network
+    env_file: .env
+    environment:
+      DB_HOST: mysql
+
+    ports:
+      # Host port 5000 → container port 5000
+      # MySQL has no ports: mapping — port 3306 is internal to app-network only (correct security posture)
+      - "5000:5000"
+
+    depends_on:
+      mysql:
+        # condition: service_healthy waits for mysqladmin ping to succeed
+        # Plain "depends_on: mysql" only waits for the container to START — not for MySQL to be READY
+        # Without this, createConnection() fires before MySQL accepts connections → process.exit(1)
+        condition: service_healthy
+
+    networks:
+      - app-network
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  # Top-level declaration required — without this, the mysql-data reference in mysql service fails
+  mysql-data:
