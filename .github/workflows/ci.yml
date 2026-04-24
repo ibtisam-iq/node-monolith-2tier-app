@@ -588,8 +588,8 @@ jobs:
           SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         run: |
-          # Install sonar-scanner CLI
-          export SONAR_SCANNER_VERSION=6.2.1.4610
+          # Install sonar-scanner CLI manually
+          export SONAR_SCANNER_VERSION=8.0.1.6346
           export SONAR_SCANNER_HOME=$HOME/.sonar/sonar-scanner-${SONAR_SCANNER_VERSION}-linux-x64
           curl --create-dirs -sSLo $HOME/.sonar/sonar-scanner.zip \
             https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux-x64.zip
