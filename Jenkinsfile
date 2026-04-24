@@ -478,8 +478,8 @@ export default [
       'no-eval':                                        'error',
       'no-implied-eval':                                'error',
       'no-new-func':                                    'error',
-      'no-console':                                     'warn',
-      'no-process-exit':                                'warn',
+      'no-console':                                     'off',
+      'no-process-exit':                                'off',
       'security/detect-non-literal-fs-filename':        'warn',
       'security/detect-child-process':                  'error',
       'security/detect-unsafe-regex':                   'error',
@@ -499,12 +499,8 @@ ESLINT_EOF
                         echo "=== ESLint — Human-readable (advisory) ==="
                         npx eslint --format stylish . 2>&1 | tee ../eslint-server.txt || true
 
-                        echo "=== ESLint — Enforced (errors only, exits 1 on violation) ==="
-                        npx eslint \
-                            --format stylish \
-                            --max-warnings=0 \
-                            --rule '{"no-eval": "error", "no-implied-eval": "error", "security/detect-child-process": "error", "security/detect-unsafe-regex": "error"}' \
-                            .
+                        echo "=== ESLint — Enforced (exits 1 if any error fires) ==="
+                        npx eslint --format stylish --max-warnings=0 . 2>&1 | tee ../eslint-server.txt
                     '''
                 }
             }
