@@ -303,29 +303,30 @@ pipeline {
         // npm ci vs npm install:
         //   npm ci reads package-lock.json exactly — reproducible, faster,
         //   no version drift. Both lockfiles must be committed to the repo.
+        //   Using npm install - lockfiles are not committed intentionally.
         //
         // --prefer-offline: uses npm cache on cache hit, falls back to registry. ────────────────────────────────────────────────────────────────────
         stage('Install Dependencies') {
             parallel {
 
-                stage('Client — npm ci') {
+                stage('Client — npm install') {
                     steps {
                         dir('client') {
                             echo '📦 Installing client dependencies (devDeps included for Webpack/Babel)...'
                             sh '''
-                                npm ci --prefer-offline
+                                npm install --prefer-offline
                                 echo "✅ Client deps: $(npm list --depth=0 2>/dev/null | wc -l) packages"
                             '''
                         }
                     }
                 }
 
-                stage('Server — npm ci (prod)') {
+                stage('Server — npm install (prod)') {
                     steps {
                         dir('server') {
                             echo '📦 Installing server dependencies (--omit=dev)...'
                             sh '''
-                                npm ci --prefer-offline --omit=dev
+                                npm install --prefer-offline --omit=dev
                                 echo "✅ Server deps: $(npm list --depth=0 --omit=dev 2>/dev/null | wc -l) packages"
                             '''
                         }
