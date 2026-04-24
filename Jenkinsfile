@@ -727,6 +727,11 @@ JEST_EOF
         //   sonar.working.directory          → pins report-task.txt location
         //                                      (required for waitForQualityGate)
         //
+        // # WRONG — Generic Test Execution format (not JUnit)
+        // # -Dsonar.testExecutionReportPaths=jest-results.xml
+        // # CORRECT — JUnit XML format
+        // -Dsonar.junit.reportPaths=jest-results.xml
+        //
         // SONAR_HOST_URL and SONAR_AUTH_TOKEN injected by withSonarQubeEnv().
         // ────────────────────────────────────────────────────────────────────
         stage('SonarQube Analysis') {
@@ -743,9 +748,6 @@ JEST_EOF
                                 -Dsonar.tests=client/src,server \\
                                 -Dsonar.test.inclusions="**/*.test.js,**/*.spec.js" \\
                                 -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \\
-                                # WRONG — Generic Test Execution format (not JUnit)
-                                # -Dsonar.testExecutionReportPaths=jest-results.xml
-                                # CORRECT — JUnit XML format
                                 -Dsonar.junit.reportPaths=jest-results.xml \\
                                 -Dsonar.exclusions="**/node_modules/**,client/public/**,coverage/**,**/*.min.js,**/jest.config.js,**/eslint.config.mjs,**/webpack.config.js" \\
                                 -Dsonar.sourceEncoding=UTF-8 \\
