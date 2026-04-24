@@ -104,7 +104,7 @@ pipeline {
 
     environment {
         // ── App metadata
-        APP_NAME    = 'node-monolith-2tier-app'
+        APP_NAME    = 'node-monolith-2tier'
         // IMAGE_TAG is intentionally NOT defined here.
         // It is read at runtime from server/package.json in Stage 3 (Versioning).
         // This ensures the image tag always matches the committed version without
@@ -537,8 +537,9 @@ ESLINT_EOF
                             eslint@^9 \
                             eslint-plugin-security@^3 \
                             eslint-plugin-react@^7 \
-                            eslint-plugin-react-hooks@^4 \
+                            eslint-plugin-react-hooks@^5 \
                             @microsoft/eslint-formatter-sarif@^3 \
+                            @babel/eslint-parser@^7 \
                             2>/dev/null
 
                         echo "=== Writing ESLint flat config for client ==="
@@ -546,11 +547,21 @@ ESLINT_EOF
 import security   from 'eslint-plugin-security';
 import react      from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
+import babelParser from '@babel/eslint-parser';
 
 export default [
   {
     files: ['src/**/*.{js,jsx}'],
     plugins: { security, react, 'react-hooks': reactHooks },
+    languageOptions: {
+      parser: babelParser,
+      parserOptions: {
+        requireConfigFile: false,
+        babelOptions: {
+          presets: ['@babel/preset-react'],
+        },
+      },
+    },
     settings: { react: { version: 'detect' } },
     rules: {
       ...security.configs.recommended.rules,
@@ -561,6 +572,7 @@ export default [
       'react/no-danger':                  'error',
       'react/jsx-no-script-url':          'error',
       'security/detect-unsafe-regex':     'error',
+      'react/prop-types':                 'warn',
     },
   },
 ];
@@ -724,14 +736,17 @@ JEST_EOF
                     withSonarQubeEnv('sonar-server') {
                         sh """
                             \$SCANNER_HOME/bin/sonar-scanner \\
-                                -Dsonar.projectKey=IbtisamIQnodemonolith \\
-                                -Dsonar.projectName=IbtisamIQnodemonolith \\
+                                -Dsonar.projectKey=${APP_NAME} \\
+                                -Dsonar.projectName=${APP_NAME} \\
                                 -Dsonar.projectVersion=${IMAGE_TAG} \\
                                 -Dsonar.sources=client/src,server \\
                                 -Dsonar.tests=client/src,server \\
                                 -Dsonar.test.inclusions="**/*.test.js,**/*.spec.js" \\
                                 -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \\
-                                -Dsonar.testExecutionReportPaths=jest-results.xml \\
+                                # WRONG — Generic Test Execution format (not JUnit)
+                                # -Dsonar.testExecutionReportPaths=jest-results.xml
+                                # CORRECT — JUnit XML format
+                                -Dsonar.junit.reportPaths=jest-results.xml
                                 -Dsonar.exclusions="**/node_modules/**,client/public/**,coverage/**,**/*.min.js,**/jest.config.js,**/eslint.config.mjs,**/webpack.config.js" \\
                                 -Dsonar.sourceEncoding=UTF-8 \\
                                 -Dsonar.working.directory=${WORKSPACE}/.scannerwork
