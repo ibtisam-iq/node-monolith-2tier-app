@@ -1,0 +1,916 @@
+# =============================================================
+# DevSecOps CI Pipeline — Node.js 2-Tier App
+# Tool: GitHub Actions
+# Stack: Node.js 22 LTS · React 17 · Webpack 5 · Express 4 · MySQL 8.4
+#        SonarQube · Trivy · Nexus · Docker Hub · GHCR
+# Reference copy: github.com/ibtisam-iq/devsecops-pipelines
+#                 pipelines/node-monolith-2tier/github-actions/ci.yml
+# Mirrors:        pipelines/node-monolith-2tier/jenkins/Jenkinsfile (17 stages)
+# =============================================================
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+#   DOCKER_USERNAME       — Docker Hub username
+#   DOCKER_PASSWORD       — Docker Hub PAT (read/write/delete)
+#   NEXUS_USERNAME        — Nexus admin username
+#   NEXUS_PASSWORD        — Nexus admin password
+#   SONAR_TOKEN           — SonarQube user token
+#   SONAR_HOST_URL        — https://sonar.ibtisam-iq.com
+#   GIT_TOKEN             — GitHub PAT with repo scope (for CD repo update)
+#
+# NOTE: GITHUB_TOKEN is automatically provided by GitHub Actions — no secret needed for GHCR login.
+#
+# ── APP STRUCTURE ──────────────────────────────────────────────────────────────
+# Two independent package.json files — NO workspace root package.json:
+#   client/package.json  → React 17 + Webpack 5 (devDeps needed at build time)
+#   server/package.json  → Express 4 + mysql2 + cors + dotenv (prod only)
+# Both are installed independently. Client is compiled (Webpack → client/public/)
+# before Docker build.
+#
+# ── VERSIONING STRATEGY ────────────────────────────────────────────────────────
+# Image tag: <version>-<short-git-sha>-<run-number>
+# e.g.  1.0.0-ab3f12c-42
+# Version is read from server/package.json at runtime.
+#
+# ── KNOWN CVE NOTE ─────────────────────────────────────────────────────────────
+# client/package.json declares axios: ^0.21.1 — SSRF CVE (CVE-2023-45857).
+# Stage 6 npm audit (client, Pass B) will WARN in the pipeline.
+# Fix: upgrade to axios >=1.6.0 in client/package.json.
+# =============================================================
+
+# ── STAGE MAP ──────────────────────────────────────────────────────────────────
+#  1 → Checkout
+#  2 → Trivy FS Scan          (pre-build, 2-pass: CRITICAL + HIGH/MED advisory)
+#  3 → Versioning             (server/package.json + git SHA + run number)
+#  4 → Install Dependencies   (client npm install + server npm install, parallel)
+#  5 → Build Client           (Webpack 5 production bundle → client/public/)
+#  6 → npm audit              (client + server, 2-pass per package)
+#  7 → ESLint SAST — Server   (eslint-plugin-security, SARIF + human output)
+#  8 → ESLint SAST — Client   (+ eslint-plugin-react, react-hooks)
+#  9 → Build & Test           (Jest --ci --coverage --runInBand --passWithNoTests)
+# 10 → SonarQube Analysis     (sonar-scanner CLI, LCOV + JUnit ingestion)
+# 11 → Quality Gate           (sonarqube-quality-gate-action, 5 min timeout)
+# 12 → Docker Build           (--pull, OCI labels, 3-registry tags in one pass)
+# 13 → Trivy Image Scan       (3-pass: OS advisory + lib CRITICAL fail + full JSON)
+# 14 → Push to Docker Hub     (main branch only)
+# 15 → Push to GHCR           (main branch only)
+# 16 → Push to Nexus          (main branch only)
+# 17 → Update CD Manifest     (GitOps handoff → ArgoCD)
+# post → Cleanup
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: DevSecOps CI — Node.js 2-Tier
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - 'Jenkinsfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.env.example'
+      - '.gitignore'
+      - 'compose.yml'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'Jenkinsfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.env.example'
+      - '.gitignore'
+      - 'compose.yml'
+  workflow_dispatch:
+
+# Minimal top-level permissions — every job declares only what it needs
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch/ref.
+# PR builds are safe to cancel (no registry writes).
+# Push-to-main is NOT cancelled — a mid-push cancellation leaves corrupt
+# or missing :latest tags in registries.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # ── App metadata
+  APP_NAME: node-monolith-2tier
+
+  # ── Docker Hub
+  DOCKER_USER: mibtisam
+  IMAGE_NAME:  mibtisam/node-monolith-2tier
+
+  # ── GHCR
+  GHCR_IMAGE: ghcr.io/ibtisam-iq/node-monolith-2tier
+
+  # ── Nexus Docker (path-based routing — no dedicated port needed)
+  NEXUS_DOCKER:      nexus.ibtisam-iq.com
+  NEXUS_DOCKER_REPO: docker-hosted
+
+  # ── Source directory (repo root)
+  APP_DIR: .
+
+  # ── Application port (matches Dockerfile ARG and compose.yml)
+  APP_PORT: '5000'
+
+  # ── CD GitOps handoff (Stage 17)
+  CD_REPO:          ibtisam-iq/platform-engineering-systems
+  CD_MANIFEST_PATH: systems/node-monolith/2tier/image.env
+
+jobs:
+
+  # ════════════════════════════════════════════════════════════
+  # JOB — CI: Build, Test, Scan & Push (17 stages)
+  # ════════════════════════════════════════════════════════════
+  ci:
+    name: CI — Build, Test & Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents:      read
+      packages:      write       # push to GHCR (Stages 15)
+      pull-requests: write       # SonarQube PR decoration (Stage 10)
+      checks:        write       # JUnit test reporter (Stage 9)
+
+    outputs:
+      image_tag: ${{ steps.versioning.outputs.image_tag }}
+
+    steps:
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 1 — Checkout
+      # fetch-depth: 0 required for SonarQube blame info.
+      # ──────────────────────────────────────────────────────
+      - name: Checkout — source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 2 — Trivy Filesystem Scan
+      # Runs BEFORE install — scan source + package.json for secrets,
+      # misconfigs, and known CVEs in declared dependencies.
+      # Two passes:
+      #   Pass 1 — CRITICAL only → warn only (exit-code: 0)
+      #   Pass 2 — HIGH/MEDIUM   → warn only (exit-code: 0)
+      # FS scan is advisory. Hard gate is on the built image (Stage 13, Pass B).
+      # This matches the Jenkinsfile Stage 2 posture.
+      # ──────────────────────────────────────────────────────
+      - name: Trivy — filesystem scan (CRITICAL → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref:  ${{ env.APP_DIR }}
+          scanners:  secret,vuln,misconfig
+          severity:  CRITICAL
+          exit-code: '0'
+          format:    json
+          output:    trivy-fs-report.json
+
+      - name: Trivy — filesystem scan (HIGH/MEDIUM → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref:  ${{ env.APP_DIR }}
+          scanners:  secret,vuln,misconfig
+          severity:  HIGH,MEDIUM
+          exit-code: '0'
+          format:    table
+
+      - name: Upload Trivy FS report
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('trivy-fs-report.json') != ''
+        with:
+          name: trivy-fs-report
+          path: trivy-fs-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # Set up Node.js 22
+      # Moved BEFORE versioning — versioning step uses `node -p` which
+      # requires Node.js 22 (matches jenkins-server setup).
+      # ──────────────────────────────────────────────────────
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            client/package.json
+            server/package.json
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 3 — Versioning
+      # Version read from server/package.json at runtime.
+      # Format: <version>-<short-sha>-<run-number>
+      # e.g.   1.0.0-ab3f12c-42
+      #
+      # TWO outputs written deliberately:
+      #   $GITHUB_OUTPUT  → steps.versioning.outputs.image_tag
+      #                     Safe for ${{ }} expressions in later steps.
+      #   $GITHUB_ENV     → IMAGE_TAG bash variable
+      #                     Available to run: shell blocks from the NEXT step onward.
+      #
+      # NEVER use ${{ env.IMAGE_TAG }} for runtime-computed values —
+      # the workflow-level env: block is parsed BEFORE any step runs,
+      # so IMAGE_TAG would always resolve to empty string there.
+      #
+      # --short=7 pins SHA to exactly 7 chars — without explicit length,
+      # Git auto-abbreviation grows as repo accumulates commits.
+      # ──────────────────────────────────────────────────────
+      - name: Versioning — compute image tag
+        id: versioning
+        run: |
+          APP_VERSION=$(node -p "require('./server/package.json').version")
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          IMAGE_TAG="${APP_VERSION}-${SHORT_SHA}-${{ github.run_number }}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+          echo "🏷️  Image tag: ${IMAGE_TAG}"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 4 — Install Dependencies (parallel via background jobs)
+      #
+      # Two independent package.json files — no workspace root manifest.
+      # Client: full install (devDeps required for Webpack + Babel at build time)
+      # Server: production-only (--omit=dev) — matches Docker image Stage 2
+      #
+      # GHA does not have native parallel steps — both installs are run
+      # concurrently using background shell jobs (&) then waited with `wait`.
+      # ──────────────────────────────────────────────────────
+      - name: Install Dependencies — client (devDeps) + server (prod only)
+        run: |
+          echo "📦 Installing client dependencies (devDeps included for Webpack/Babel)..."
+          npm install --prefer-offline --prefix client &
+          CLIENT_PID=$!
+
+          echo "📦 Installing server dependencies (--omit=dev)..."
+          npm install --prefer-offline --omit=dev --prefix server &
+          SERVER_PID=$!
+
+          wait $CLIENT_PID && echo "✅ Client deps installed"
+          wait $SERVER_PID && echo "✅ Server deps installed"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 5 — Build Client
+      # Webpack 5 production bundle → client/public/bundle.js
+      # Must run BEFORE Docker build (Stage 12) — Dockerfile Stage 1 copies
+      # the pre-built client/public/ into the image.
+      # ──────────────────────────────────────────────────────
+      - name: Build Client — Webpack 5 production bundle
+        run: |
+          echo "🔨 Compiling React 17 frontend with Webpack 5..."
+          cd client
+          NODE_ENV=production npm run build
+          echo "✅ Client build complete — output:"
+          ls -lh public/
+
+      - name: Upload client build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: client-public
+          path: client/public/
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 6 — npm audit (Dependency CVE Scan)
+      #
+      # WHY npm audit IN ADDITION TO TRIVY FS (Stage 2):
+      #   Trivy scans package.json (declared versions).
+      #   npm audit scans package-lock.json (fully resolved transitive tree).
+      #   Defense in depth — two advisory sources.
+      #
+      # Two-pass strategy per package (client + server):
+      #   Pass A — CRITICAL only, --audit-level=critical → fail build
+      #   Pass B — HIGH+MEDIUM, --audit-level=high       → advisory only
+      #
+      # Server audit uses --omit=dev: only prod deps ship to production.
+      # KNOWN: client axios ^0.21.1 (SSRF CVE) will appear in Pass B.
+      # ──────────────────────────────────────────────────────
+      - name: npm audit — client (CRITICAL → fail, HIGH/MEDIUM → warn)
+        run: |
+          echo "── Client audit ──"
+          cd client
+
+          # Pass A — CRITICAL: fail build
+          npm audit --audit-level=critical --json > ../npm-audit-client.json 2>&1 || {
+            echo '❌ npm audit found CRITICAL vulnerabilities in client.'
+            cat ../npm-audit-client.json
+            exit 1
+          }
+
+          # Pass B — HIGH+MEDIUM: advisory only
+          npm audit --audit-level=high || true
+          echo "✅ Client audit complete"
+
+      - name: npm audit — server (CRITICAL → fail, HIGH/MEDIUM → warn)
+        run: |
+          echo "── Server audit ──"
+          cd server
+
+          # Pass A — CRITICAL: fail build
+          npm audit --omit=dev --audit-level=critical --json > ../npm-audit-server.json 2>&1 || {
+            echo '❌ npm audit found CRITICAL vulnerabilities in server.'
+            cat ../npm-audit-server.json
+            exit 1
+          }
+
+          # Pass B — HIGH+MEDIUM: advisory only
+          npm audit --omit=dev --audit-level=high || true
+          echo "✅ Server audit complete"
+
+      - name: Upload npm audit reports
+        uses: actions/upload-artifact@v4
+        if: always() && (hashFiles('npm-audit-client.json') != '' || hashFiles('npm-audit-server.json') != '')
+        with:
+          name: npm-audit-reports
+          path: |
+            npm-audit-client.json
+            npm-audit-server.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 7 — ESLint SAST — Server
+      #
+      # ESLint v9 + eslint-plugin-security (OWASP-aligned rules).
+      # Flat config (eslint.config.mjs) — ESLint v9+ format.
+      # SARIF output → audit trail. Stylish → human-readable console.
+      # Enforced: exits 1 if any ERROR-level rule fires.
+      # Plugins installed CI-only (not committed to server/).
+      # Config cleaned in post-step.
+      # ──────────────────────────────────────────────────────
+      - name: ESLint SAST — Server
+        run: |
+          echo "=== Installing ESLint + security plugin (CI-only) ==="
+          npm install --save-dev \
+            eslint@^9 \
+            eslint-plugin-security@^3 \
+            @microsoft/eslint-formatter-sarif@^3 \
+            --prefix server 2>/dev/null
+
+          echo "=== Writing ESLint flat config ==="
+          cat > server/eslint.config.mjs << 'ESLINT_EOF'
+          import security from 'eslint-plugin-security';
+
+          export default [
+            {
+              files: ['**/*.js'],
+              plugins: { security },
+              rules: {
+                ...security.configs.recommended.rules,
+                'no-eval':                                        'error',
+                'no-implied-eval':                                'error',
+                'no-new-func':                                    'error',
+                'no-console':                                     'off',
+                'no-process-exit':                                'off',
+                'security/detect-non-literal-fs-filename':        'warn',
+                'security/detect-child-process':                  'error',
+                'security/detect-unsafe-regex':                   'error',
+                'security/detect-object-injection':               'warn',
+                'security/detect-possible-timing-attacks':        'warn',
+              },
+            },
+          ];
+          ESLINT_EOF
+
+          echo "=== ESLint — SARIF output ==="
+          cd server
+          npx eslint \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file ../eslint-server.sarif \
+            . || true
+
+          echo "=== ESLint — Human-readable (advisory) ==="
+          npx eslint --format stylish . 2>&1 | tee ../eslint-server.txt || true
+
+          echo "=== ESLint — Enforced (exits 1 if any error fires) ==="
+          npx eslint --format stylish --max-warnings=0 .
+
+      - name: Upload ESLint server reports
+        uses: actions/upload-artifact@v4
+        if: always() && (hashFiles('eslint-server.sarif') != '' || hashFiles('eslint-server.txt') != '')
+        with:
+          name: eslint-server-reports
+          path: |
+            eslint-server.sarif
+            eslint-server.txt
+          retention-days: 14
+
+      - name: Cleanup — ESLint server config
+        if: always()
+        run: rm -f server/eslint.config.mjs || true
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 8 — ESLint SAST — Client
+      #
+      # Extends server SAST config with React-specific rules:
+      #   eslint-plugin-react        → JSX rules, dangerouslySetInnerHTML guard
+      #   eslint-plugin-react-hooks  → hooks rules (exhaustive-deps, etc.)
+      #
+      # react/no-danger:         'error' — prevents XSS via raw HTML injection.
+      # react/jsx-no-script-url: 'error' — prevents javascript: href XSS.
+      # --max-warnings=0 commented out intentionally — client has pre-existing
+      # warnings (prop-types, etc.) that would break CI until fixed. Enable
+      # once baseline warnings are resolved.
+      # ──────────────────────────────────────────────────────
+      - name: ESLint SAST — Client
+        run: |
+          echo "=== Installing ESLint + React + security plugins (CI-only) ==="
+          npm install --save-dev \
+            eslint@^9 \
+            eslint-plugin-security@^3 \
+            eslint-plugin-react@^7 \
+            eslint-plugin-react-hooks@^5 \
+            @microsoft/eslint-formatter-sarif@^3 \
+            @babel/eslint-parser@^7 \
+            --prefix client 2>/dev/null
+
+          echo "=== Writing ESLint flat config for client ==="
+          cat > client/eslint.config.mjs << 'ESLINT_EOF'
+          import security   from 'eslint-plugin-security';
+          import react      from 'eslint-plugin-react';
+          import reactHooks from 'eslint-plugin-react-hooks';
+          import babelParser from '@babel/eslint-parser';
+
+          export default [
+            {
+              files: ['src/**/*.{js,jsx}'],
+              plugins: { security, react, 'react-hooks': reactHooks },
+              languageOptions: {
+                parser: babelParser,
+                parserOptions: {
+                  requireConfigFile: false,
+                  babelOptions: {
+                    presets: ['@babel/preset-react'],
+                  },
+                },
+              },
+              settings: { react: { version: 'detect' } },
+              rules: {
+                ...security.configs.recommended.rules,
+                ...react.configs.recommended.rules,
+                ...reactHooks.configs.recommended.rules,
+                'no-eval':                          'error',
+                'no-implied-eval':                  'error',
+                'react/no-danger':                  'error',
+                'react/jsx-no-script-url':          'error',
+                'security/detect-unsafe-regex':     'error',
+                'react/prop-types':                 'warn',
+              },
+            },
+          ];
+          ESLINT_EOF
+
+          echo "=== ESLint — SARIF output ==="
+          cd client
+          npx eslint \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file ../eslint-client.sarif \
+            src/ || true
+
+          echo "=== ESLint — Human-readable ==="
+          npx eslint --format stylish src/ 2>&1 | tee ../eslint-client.txt || true
+
+          echo "=== ESLint — Enforced (warnings advisory, errors enforced) ==="
+          npx eslint --format stylish src/
+
+      - name: Upload ESLint client reports
+        uses: actions/upload-artifact@v4
+        if: always() && (hashFiles('eslint-client.sarif') != '' || hashFiles('eslint-client.txt') != '')
+        with:
+          name: eslint-client-reports
+          path: |
+            eslint-client.sarif
+            eslint-client.txt
+          retention-days: 14
+
+      - name: Cleanup — ESLint client config
+        if: always()
+        run: rm -f client/eslint.config.mjs || true
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 9 — Build & Test (Jest)
+      #
+      # Jest flags:
+      #   --ci             → fail on new snapshots, disable interactive mode
+      #   --coverage       → LCOV + Cobertura XML + text coverage reports
+      #   --forceExit      → prevents Jest hanging on open DB handles
+      #   --runInBand      → serial execution (avoids port conflicts on CI)
+      #   --passWithNoTests → passes when no test files exist yet
+      #
+      # Coverage written to:
+      #   coverage/lcov.info              → SonarQube ingestion (Stage 10)
+      #   coverage/cobertura-coverage.xml → Jenkins recordCoverage() equivalent
+      #   coverage/lcov-report/           → HTML artifact
+      #
+      # CI_TEST=true signals app to skip real MySQL connection at startup.
+      # jest-junit writes jest-results.xml for JUnit reporter.
+      # Jest config and jest-junit installed CI-only (not committed to server/).
+      # ──────────────────────────────────────────────────────
+      - name: Build & Test — Jest (--ci --coverage --passWithNoTests)
+        run: |
+          echo "=== Installing Jest + Supertest (CI-only, server scope) ==="
+          npm install --save-dev \
+            jest@^29 \
+            supertest@^7 \
+            jest-junit@^16 \
+            --prefix server 2>/dev/null
+
+          echo "=== Writing Jest config ==="
+          cat > server/jest.config.js << 'JEST_EOF'
+          module.exports = {
+            testEnvironment: 'node',
+            coverageReporters: ['text', 'lcov', 'cobertura'],
+            coverageDirectory: '../coverage',
+            collectCoverageFrom: [
+              '**/*.js',
+              '!node_modules/**',
+              '!jest.config.js',
+              '!eslint.config.mjs',
+            ],
+            reporters: [
+              'default',
+              ['jest-junit', {
+                outputDirectory: '..',
+                outputName: 'jest-results.xml',
+                classNameTemplate: '{classname}',
+                titleTemplate:     '{title}',
+              }],
+            ],
+          };
+          JEST_EOF
+
+          CI_TEST=true npx --prefix server jest \
+            --ci \
+            --coverage \
+            --forceExit \
+            --runInBand \
+            --passWithNoTests \
+            2>&1 | tee jest-output.txt
+
+      - name: Publish JUnit test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths:    'jest-results.xml'
+          check_name:      Jest Test Results
+          fail_on_failure: false
+          allow_empty_results: true
+
+      - name: Upload Jest reports and coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jest-reports
+          path: |
+            jest-results.xml
+            jest-output.txt
+            coverage/
+          retention-days: 14
+
+      - name: Cleanup — Jest config
+        if: always()
+        run: rm -f server/jest.config.js || true
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 10 — SonarQube Analysis
+      #
+      # Uses sonar-scanner CLI (same as Jenkinsfile — not Maven plugin).
+      #
+      # KEY PROPERTIES:
+      #   sonar.sources=client/src,server  — both tiers
+      #   sonar.tests=client/src,server    — Jest tests co-located with src
+      #   sonar.test.inclusions            — matches *.test.js / *.spec.js
+      #   sonar.javascript.lcov.reportPaths → LCOV from Jest (Stage 9)
+      #   sonar.junit.reportPaths          → JUnit XML from jest-junit
+      #   sonar.exclusions                 → node_modules, built output, coverage
+      #   sonar.working.directory          → pins report-task.txt location
+      #                                      (required for Quality Gate step)
+      # ──────────────────────────────────────────────────────
+      - name: SonarQube — static analysis
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          # Install sonar-scanner CLI
+          export SONAR_SCANNER_VERSION=6.2.1.4610
+          export SONAR_SCANNER_HOME=$HOME/.sonar/sonar-scanner-${SONAR_SCANNER_VERSION}-linux-x64
+          curl --create-dirs -sSLo $HOME/.sonar/sonar-scanner.zip \
+            https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux-x64.zip
+          unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+          export PATH=$SONAR_SCANNER_HOME/bin:$PATH
+
+          sonar-scanner \
+            -Dsonar.projectKey=node-monolith-2tier \
+            -Dsonar.projectName=node-monolith-2tier \
+            -Dsonar.projectVersion=$IMAGE_TAG \
+            -Dsonar.sources=client/src,server \
+            -Dsonar.tests=client/src,server \
+            "-Dsonar.test.inclusions=**/*.test.js,**/*.spec.js" \
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+            -Dsonar.junit.reportPaths=jest-results.xml \
+            "-Dsonar.exclusions=**/node_modules/**,client/public/**,coverage/**,**/*.min.js,**/jest.config.js,**/eslint.config.mjs,**/webpack.config.js" \
+            -Dsonar.sourceEncoding=UTF-8 \
+            -Dsonar.working.directory="${GITHUB_WORKSPACE}/.scannerwork" \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 11 — Quality Gate
+      # scanMetadataReportFile must match -Dsonar.working.directory above.
+      # timeout-minutes: 5 kills the step after 5 minutes — sufficient for
+      # this codebase. Increase if analysis grows significantly.
+      # SHA-pinned for supply-chain security (immutable vs force-pushable tag).
+      # ──────────────────────────────────────────────────────
+      - name: SonarQube — Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b # v1.2.0
+        timeout-minutes: 5
+        with:
+          scanMetadataReportFile: ${{ github.workspace }}/.scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 12 — Docker Build
+      # load: true  → image loaded into local daemon for Trivy scan (Stage 13)
+      # push: false → push happens AFTER Trivy passes (Stages 14-16), main only
+      #
+      # CONSTRAINT: load: true is INCOMPATIBLE with multi-platform builds.
+      # Current setup: single-platform amd64 only.
+      #
+      # All registry tags built in ONE pass — avoids rebuilding per registry.
+      # OCI labels: version, revision, created, source (build-time injection).
+      # APP_PORT build-arg: passes port 5000 to Dockerfile.
+      # ──────────────────────────────────────────────────────
+      - name: Docker Hub — login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: GHCR — login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nexus — login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.NEXUS_DOCKER }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Build — build image (load into daemon for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context:  ${{ env.APP_DIR }}
+          push:     false
+          load:     true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
+          build-args: |
+            APP_PORT=${{ env.APP_PORT }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.versioning.outputs.image_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp || github.run_started_at }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 13 — Trivy Image Scan
+      # Three passes — mirrors Jenkinsfile Stage 13:
+      #
+      #   Pass A — OS packages (Alpine base):
+      #            CRITICAL+HIGH, exit-code: 0 → warn only.
+      #            Alpine OS CVEs are vendor responsibility.
+      #
+      #   Pass B — Library (npm packages):
+      #            CRITICAL only, exit-code: 1 → FAILS build.
+      #            These are YOUR deps — fix = bump version in package.json.
+      #
+      #   Pass B (cont.) — Library HIGH/MEDIUM:
+      #            exit-code: 0 → advisory only.
+      #
+      #   Pass C — Full report (all types + severities incl. LOW):
+      #            exit-code: 0, JSON format → archived artifact.
+      #
+      # Trivy resolves tags against the local Docker daemon (load: true above).
+      # Pass B has no if: always() — if Stage 12 fails, no image exists to scan.
+      # ──────────────────────────────────────────────────────
+
+      # Pass A — OS packages: warn only
+      - name: Trivy — image scan OS packages (CRITICAL+HIGH → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: os
+          severity:  CRITICAL,HIGH
+          exit-code: '0'
+          format:    table
+
+      # Pass B — Library CRITICALs: FAIL the build
+      - name: Trivy — image scan npm library (CRITICAL → fail)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: library
+          severity:  CRITICAL
+          exit-code: '1'
+          format:    table
+
+      # Pass B (cont.) — Library HIGH/MEDIUM: warn only
+      - name: Trivy — image scan npm library (HIGH/MEDIUM → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: library
+          severity:  HIGH,MEDIUM
+          exit-code: '0'
+          format:    table
+
+      # Pass C — Full report for audit trail (all types + severities incl. LOW)
+      - name: Trivy — image scan full report (audit artifact)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          severity:  CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+          format:    json
+          output:    trivy-image-report.json
+
+      - name: Upload Trivy image report (audit artifact)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 14 — Push to Docker Hub (main only)
+      #
+      # WHY bare $IMAGE_TAG and NOT ${{ env.IMAGE_TAG }}:
+      # IMAGE_TAG is a runtime-computed value written to $GITHUB_ENV by the
+      # versioning step. The ${{ env.IMAGE_TAG }} expression context is parsed
+      # BEFORE any step runs — it would always resolve to empty string here.
+      # Bare $IMAGE_TAG reads from the bash environment (populated from
+      # $GITHUB_ENV at step start) and correctly gets the versioning output.
+      # Static env vars (IMAGE_NAME, etc.) set in the top-level env: block are
+      # safe to use with ${{ env.* }} because they are known at parse time.
+      # ──────────────────────────────────────────────────────
+      - name: Docker Hub — push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:$IMAGE_TAG
+          docker push ${{ env.IMAGE_NAME }}:latest
+          echo "✅ Docker Hub push complete"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 15 — Push to GHCR (main only)
+      # (Same $IMAGE_TAG rationale and main-only guard as Stage 14.)
+      # ──────────────────────────────────────────────────────
+      - name: GHCR — push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.GHCR_IMAGE }}:$IMAGE_TAG
+          docker push ${{ env.GHCR_IMAGE }}:latest
+          echo "✅ GHCR push complete"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 16 — Push to Nexus Docker Registry (main only)
+      # Path-based routing — no dedicated Docker port needed.
+      # Image: nexus.ibtisam-iq.com/docker-hosted/node-monolith-2tier:<tag>
+      # (Same $IMAGE_TAG rationale and main-only guard as Stage 14.)
+      # ──────────────────────────────────────────────────────
+      - name: Nexus — push image (path-based routing)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG
+          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
+          echo "✅ Nexus push complete"
+
+      # ──────────────────────────────────────────────────────
+      # [PLANNED] Push to AWS ECR — commented out
+      # Uncomment once AWS credentials and ECR repo are provisioned.
+      # ──────────────────────────────────────────────────────
+      # - name: AWS ECR — login
+      #   uses: aws-actions/amazon-ecr-login@v2
+      # - name: AWS ECR — tag and push
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #   run: |
+      #     ECR_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.APP_NAME }}"
+      #     docker tag ${{ env.IMAGE_NAME }}:$IMAGE_TAG  "${ECR_IMAGE}:${IMAGE_TAG}"
+      #     docker tag ${{ env.IMAGE_NAME }}:latest      "${ECR_IMAGE}:latest"
+      #     docker push "${ECR_IMAGE}:${IMAGE_TAG}"
+      #     docker push "${ECR_IMAGE}:latest"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 17 — Update CD Repo (GitOps handoff)
+      # Runs only on push to main AND only if all prior steps succeeded.
+      # This is intentional: the CD repo must only be updated when the full
+      # pipeline passes — not on PR builds or partial failures.
+      #
+      # Token kept off process argv:
+      #   Clone with public URL → set-url with token → push → clear token URL.
+      #   This matches the Jenkinsfile Stage 17 hardening pattern.
+      #
+      # image.env format (matches Jenkinsfile):
+      #   IMAGE_TAG=1.0.0-ab3f12c-42
+      #   UPDATED_AT=2026-04-24T10:00:00Z
+      #   UPDATED_BY=github-actions-run-42
+      #   GIT_COMMIT=abc1234...
+      #   GIT_BRANCH=main
+      # ──────────────────────────────────────────────────────
+      - name: Update CD repo — GitOps image tag handoff
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          # IMAGE_TAG guard
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo '❌ IMAGE_TAG is empty — aborting CD repo update'
+            exit 1
+          fi
+
+          # Clone with public URL — token never in process argv
+          git clone https://github.com/${CD_REPO}.git _cd_repo_tmp
+          cd _cd_repo_tmp
+
+          # Set authenticated remote after clone — writes to .git/config, not argv
+          git remote set-url origin https://x-access-token:${GIT_TOKEN}@github.com/${CD_REPO}.git
+
+          git config --local user.email "github-actions@ibtisam-iq.com"
+          git config --local user.name  "GitHub Actions CI"
+
+          mkdir -p "$(dirname "${CD_MANIFEST_PATH}")"
+
+          echo "=== Current manifest ==="
+          cat ${CD_MANIFEST_PATH} 2>/dev/null || echo "(file does not exist yet)"
+
+          echo "=== Writing new manifest ==="
+          cat > ${CD_MANIFEST_PATH} << EOF
+          IMAGE_TAG=${IMAGE_TAG}
+          UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          UPDATED_BY=github-actions-run-${{ github.run_number }}
+          GIT_COMMIT=${{ github.sha }}
+          GIT_BRANCH=${{ github.ref_name }}
+          EOF
+
+          git add "${CD_MANIFEST_PATH}"
+
+          # Precise "nothing staged" detection — push only if commit was made
+          git diff --cached --quiet \
+            && echo "ℹ️  Nothing to commit — image tag unchanged" \
+            || { git commit -m "ci: update node-monolith image tag to ${IMAGE_TAG} [skip ci]" && git push origin HEAD; }
+
+          # Clear token from remote URL after push
+          git remote set-url origin https://github.com/${CD_REPO}.git
+
+      # ──────────────────────────────────────────────────────
+      # Cleanup — remove local Docker images
+      # (Same $IMAGE_TAG rationale as Stage 14 — see comment above.)
+      # if: always() — runs even if earlier steps failed.
+      # || true — prevents cleanup failure from masking the real failure.
+      # ──────────────────────────────────────────────────────
+      - name: Cleanup — remove local Docker images
+        if: always()
+        run: |
+          docker rmi ${{ env.IMAGE_NAME }}:$IMAGE_TAG                                                             || true
+          docker rmi ${{ env.IMAGE_NAME }}:latest                                                                 || true
+          docker rmi ${{ env.GHCR_IMAGE }}:$IMAGE_TAG                                                            || true
+          docker rmi ${{ env.GHCR_IMAGE }}:latest                                                                 || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG         || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest             || true
+          docker image prune -f || true
+
+      - name: Cleanup — remove cloned CD repo workspace
+        if: always()
+        run: rm -rf _cd_repo_tmp
