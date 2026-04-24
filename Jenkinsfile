@@ -746,7 +746,7 @@ JEST_EOF
                                 # WRONG — Generic Test Execution format (not JUnit)
                                 # -Dsonar.testExecutionReportPaths=jest-results.xml
                                 # CORRECT — JUnit XML format
-                                -Dsonar.junit.reportPaths=jest-results.xml
+                                -Dsonar.junit.reportPaths=jest-results.xml \\
                                 -Dsonar.exclusions="**/node_modules/**,client/public/**,coverage/**,**/*.min.js,**/jest.config.js,**/eslint.config.mjs,**/webpack.config.js" \\
                                 -Dsonar.sourceEncoding=UTF-8 \\
                                 -Dsonar.working.directory=${WORKSPACE}/.scannerwork
