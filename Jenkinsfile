@@ -53,12 +53,6 @@
 // the deployable unit. Client version follows the server version.
 // ──────────────────────────────────────────────────────────────────────────────
 //
-// ── KNOWN CVE NOTE ────────────────────────────────────────────────────────────
-// client/package.json declares axios: ^0.21.1 — SSRF CVE (CVE-2023-45857).
-// Stage 6 npm audit (client, Pass B) will WARN in the pipeline.
-// Fix: upgrade to axios >=1.6.0 in client/package.json.
-// ──────────────────────────────────────────────────────────────────────────────
-//
 // ── MIGRATION NOTE ────────────────────────────────────────────────────────────
 // This Jenkinsfile lives at the application source repository root:
 //   Repo:        ibtisam-iq/node-monolith-2tier-app
