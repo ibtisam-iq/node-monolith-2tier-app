@@ -27,17 +27,6 @@
 # Both are installed independently. Client is compiled (Webpack → client/public/)
 # before Docker build.
 #
-# ── VERSIONING STRATEGY ────────────────────────────────────────────────────────
-# Image tag: <version>-<short-git-sha>-<run-number>
-# e.g.  1.0.0-ab3f12c-42
-# Version is read from server/package.json at runtime.
-#
-# ── KNOWN CVE NOTE ─────────────────────────────────────────────────────────────
-# client/package.json declares axios: ^0.21.1 — SSRF CVE (CVE-2023-45857).
-# Stage 6 npm audit (client, Pass B) will WARN in the pipeline.
-# Fix: upgrade to axios >=1.6.0 in client/package.json.
-# =============================================================
-
 # ── STAGE MAP ──────────────────────────────────────────────────────────────────
 #  1 → Checkout
 #  2 → Trivy FS Scan          (pre-build, 2-pass: CRITICAL + HIGH/MED advisory)
@@ -293,8 +282,6 @@ jobs:
       #   Pass A — CRITICAL only, --audit-level=critical → fail build
       #   Pass B — HIGH+MEDIUM, --audit-level=high       → advisory only
       #
-      # Server audit uses --omit=dev: only prod deps ship to production.
-      # KNOWN: client axios ^0.21.1 (SSRF CVE) will appear in Pass B.
       # ──────────────────────────────────────────────────────
       - name: npm audit — client (CRITICAL → fail, HIGH/MEDIUM → warn)
         run: |
@@ -905,10 +892,10 @@ jobs:
         run: |
           docker rmi ${{ env.IMAGE_NAME }}:$IMAGE_TAG                                                             || true
           docker rmi ${{ env.IMAGE_NAME }}:latest                                                                 || true
-          docker rmi ${{ env.GHCR_IMAGE }}:$IMAGE_TAG                                                            || true
+          docker rmi ${{ env.GHCR_IMAGE }}:$IMAGE_TAG                                                             || true
           docker rmi ${{ env.GHCR_IMAGE }}:latest                                                                 || true
-          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG         || true
-          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest             || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG          || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest              || true
           docker image prune -f || true
 
       - name: Cleanup — remove cloned CD repo workspace
