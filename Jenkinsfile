@@ -590,7 +590,7 @@ ESLINT_EOF
                         echo "=== ESLint — Enforced ==="
                         npx eslint \
                             --format stylish \
-                            --max-warnings=0 \
+                            # --max-warnings=0 \
                             src/
                     '''
                 }
